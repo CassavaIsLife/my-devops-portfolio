@@ -1,40 +1,76 @@
-"""
-URL Shortener API with Prometheus metrics
-A simple Flask application demonstrating DevOps practices
-"""
+import os
+import secrets
 import sqlite3
 import string
-import random
-import os
-from flask import Flask, request, redirect, jsonify, render_template_string
-from prometheus_flask_exporter import PrometheusMetrics
+from contextlib import contextmanager
+from urllib.parse import urlparse
+
+from flask import Flask, request, jsonify, render_template_string, redirect
 
 app = Flask(__name__)
-metrics = PrometheusMetrics(app)
+DB_FILE = 'urls.db'
 
-# Database file path (configurable via environment variable)
-DB_FILE = os.environ.get('DB_FILE', 'urls.db')
+ALPHABET = string.ascii_letters + string.digits
+RESERVED_CODES = {'health', 'stats', 'shorten', 'static'}
+MAX_URL_LENGTH = 2048
+
+
+def get_db_path():
+    return os.environ.get('DB_FILE', DB_FILE)
+
+
+@contextmanager
+def get_db():
+    """Open a connection, commit on success, always close."""
+    conn = sqlite3.connect(get_db_path())
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 def init_db():
-    """Initialize SQLite database with URLs table"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS urls
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  short_code TEXT UNIQUE NOT NULL,
-                  long_url TEXT NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  clicks INTEGER DEFAULT 0)''')
-    conn.commit()
-    conn.close()
+    """Initialize the SQLite database schema"""
+    with get_db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS urls
+                        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         short_code TEXT UNIQUE NOT NULL,
+                         long_url TEXT NOT NULL,
+                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                         clicks INTEGER DEFAULT 0)''')
+
 
 def generate_short_code(length=6):
-    """Generate a random short code"""
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(length))
+    """Generate a cryptographically random short code"""
+    return ''.join(secrets.choice(ALPHABET) for _ in range(length))
+
+
+def normalize_url(raw):
+    """Return a valid http(s) URL or None."""
+    if not isinstance(raw, str):
+        return None
+    url = raw.strip()
+    if not url or len(url) > MAX_URL_LENGTH:
+        return None
+    if '://' not in url:
+        url = f'https://{url}'
+    try:
+        parsed = urlparse(url)
+        _ = parsed.port  # raises ValueError on a non-numeric/out-of-range port
+    except ValueError:
+        return None
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return None
+    return url
+
 
 # Initialize database on startup
 init_db()
+
 
 @app.route('/')
 def home():
@@ -45,75 +81,66 @@ def home():
         <ul>
             <li><b>POST /shorten</b> - Create short URL (JSON: {"url": "https://example.com"})</li>
             <li><b>GET /&lt;short_code&gt;</b> - Redirect to original URL</li>
+            <li><b>GET /stats/&lt;short_code&gt;</b> - Click statistics</li>
             <li><b>GET /health</b> - Health check</li>
-            <li><b>GET /metrics</b> - Prometheus metrics</li>
         </ul>
     ''')
+
 
 @app.route('/shorten', methods=['POST'])
 def shorten_url():
     """Create a shortened URL"""
-    data = request.get_json()
-    if not data or 'url' not in data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or 'url' not in data:
         return jsonify({"error": "Missing 'url' field"}), 400
-    
-    long_url = data['url']
-    
-    # Basic URL validation
-    if not long_url.startswith(('http://', 'https://')):
-        long_url = f'https://{long_url}'
-    
-    # Generate unique short code
-    short_code = generate_short_code()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    # Ensure uniqueness
-    while True:
-        c.execute("SELECT 1 FROM urls WHERE short_code = ?", (short_code,))
-        if not c.fetchone():
-            break
-        short_code = generate_short_code()
-    
-    c.execute("INSERT INTO urls (short_code, long_url) VALUES (?, ?)",
-              (short_code, long_url))
-    conn.commit()
-    conn.close()
-    
+
+    long_url = normalize_url(data['url'])
+    if long_url is None:
+        return jsonify({"error": "Invalid URL"}), 400
+
+    with get_db() as conn:
+        # Rely on the UNIQUE constraint instead of check-then-insert (race-free)
+        for _ in range(10):
+            short_code = generate_short_code()
+            if short_code in RESERVED_CODES:
+                continue
+            try:
+                conn.execute("INSERT INTO urls (short_code, long_url) VALUES (?, ?)",
+                             (short_code, long_url))
+                break
+            except sqlite3.IntegrityError:
+                continue
+        else:
+            return jsonify({"error": "Could not generate a unique code"}), 500
+
     return jsonify({
         "short_code": short_code,
-        "short_url": f"/{short_code}",
+        "short_url": f"{request.host_url}{short_code}",
         "original_url": long_url
     }), 201
+
 
 @app.route('/<short_code>')
 def redirect_to_url(short_code):
     """Redirect to original URL"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT long_url FROM urls WHERE short_code = ?", (short_code,))
-    row = c.fetchone()
-    
-    if row:
-        # Increment click counter
-        c.execute("UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?", (short_code,))
-        conn.commit()
-        conn.close()
-        return redirect(row[0], code=302)
-    
-    conn.close()
-    return jsonify({"error": "Short URL not found"}), 404
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?", (short_code,))
+        if cur.rowcount == 0:
+            return jsonify({"error": "Short URL not found"}), 404
+        row = conn.execute(
+            "SELECT long_url FROM urls WHERE short_code = ?", (short_code,)).fetchone()
+    return redirect(row[0], code=302)
+
 
 @app.route('/stats/<short_code>')
 def get_stats(short_code):
     """Get statistics for a short URL"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT short_code, long_url, created_at, clicks FROM urls WHERE short_code = ?",
-              (short_code,))
-    row = c.fetchone()
-    conn.close()
-    
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT short_code, long_url, created_at, clicks FROM urls WHERE short_code = ?",
+            (short_code,)).fetchone()
+
     if row:
         return jsonify({
             "short_code": row[0],
@@ -123,10 +150,17 @@ def get_stats(short_code):
         })
     return jsonify({"error": "Short URL not found"}), 404
 
+
 @app.route('/health')
 def health():
-    """Health check endpoint"""
+    """Health check endpoint that actually touches the database"""
+    try:
+        with get_db() as conn:
+            conn.execute("SELECT 1 FROM urls LIMIT 1")
+    except sqlite3.Error:
+        return jsonify({"status": "unhealthy", "database": "error"}), 503
     return jsonify({"status": "healthy", "database": "connected"}), 200
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
